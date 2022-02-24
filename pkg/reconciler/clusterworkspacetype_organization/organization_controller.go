@@ -20,7 +20,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"time"
 
 	jsonpatch "github.com/evanphx/json-patch"
 
@@ -29,18 +28,16 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clusters"
-	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 
 	tenancyv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/tenancy/v1alpha1"
 	kcpclient "github.com/kcp-dev/kcp/pkg/client/clientset/versioned"
 	tenancyinformer "github.com/kcp-dev/kcp/pkg/client/informers/externalversions/tenancy/v1alpha1"
 	tenancylister "github.com/kcp-dev/kcp/pkg/client/listers/tenancy/v1alpha1"
+	"github.com/kcp-dev/kcp/pkg/reconciler"
 )
 
 const (
@@ -52,97 +49,39 @@ func NewController(
 	crdClient apiextensionclientset.ClusterInterface,
 	kcpClient kcpclient.ClusterInterface,
 	workspaceInformer tenancyinformer.ClusterWorkspaceInformer,
-) (*controller, error) {
-	queue := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), controllerName)
-
+) (reconciler.Reconciler, error) {
 	c := &controller{
-		queue:           queue,
 		dynamicClient:   dynamicCLient,
 		crdClient:       crdClient,
 		kcpClient:       kcpClient,
 		workspaceLister: workspaceInformer.Lister(),
-		syncChecks: []cache.InformerSynced{
-			workspaceInformer.Informer().HasSynced,
-		},
 	}
 
+	r := reconciler.NewReconciler(
+		controllerName,
+		"ClusterWorkspaceType organization",
+		c.process,
+		[]cache.InformerSynced{
+			workspaceInformer.Informer().HasSynced,
+		},
+	)
+
 	workspaceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    func(obj interface{}) { c.enqueue(obj) },
-		UpdateFunc: func(_, obj interface{}) { c.enqueue(obj) },
+		AddFunc:    func(obj interface{}) { r.Enqueue(obj) },
+		UpdateFunc: func(_, obj interface{}) { r.Enqueue(obj) },
 	})
 
-	return c, nil
+	return r, nil
 }
 
 // controller watches Workspaces and WorkspaceShards in order to make sure every ClusterWorkspace
 // is scheduled to a valid WorkspaceShard.
 type controller struct {
-	queue workqueue.RateLimitingInterface
-
 	dynamicClient dynamic.ClusterInterface
 	crdClient     apiextensionclientset.ClusterInterface
 	kcpClient     kcpclient.ClusterInterface
 
 	workspaceLister tenancylister.ClusterWorkspaceLister
-
-	syncChecks []cache.InformerSynced
-}
-
-func (c *controller) enqueue(obj interface{}) {
-	key, err := cache.MetaNamespaceKeyFunc(obj)
-	if err != nil {
-		runtime.HandleError(err)
-		return
-	}
-	klog.Infof("queueing cluster workspace %q", key)
-	c.queue.Add(key)
-}
-
-func (c *controller) Start(ctx context.Context, numThreads int) {
-	defer runtime.HandleCrash()
-	defer c.queue.ShutDown()
-
-	klog.Info("Starting ClusterWorkspaceType organization controller")
-	defer klog.Info("Shutting down ClusterWorkspaceType organization controller")
-
-	if !cache.WaitForNamedCacheSync(controllerName, ctx.Done(), c.syncChecks...) {
-		klog.Warning("Failed to wait for caches to sync")
-		return
-	}
-
-	for i := 0; i < numThreads; i++ {
-		go wait.Until(func() { c.startWorker(ctx) }, time.Second, ctx.Done())
-	}
-
-	<-ctx.Done()
-}
-
-func (c *controller) startWorker(ctx context.Context) {
-	for c.processNextWorkItem(ctx) {
-	}
-}
-
-func (c *controller) processNextWorkItem(ctx context.Context) bool {
-	// Wait until there is a new item in the working queue
-	k, quit := c.queue.Get()
-	if quit {
-		return false
-	}
-	key := k.(string)
-
-	klog.Infof("processing key %q", key)
-
-	// No matter what, tell the queue we're done with this key, to unblock
-	// other workers.
-	defer c.queue.Done(key)
-
-	if err := c.process(ctx, key); err != nil {
-		runtime.HandleError(fmt.Errorf("%q controller failed to sync %q, err: %w", controllerName, key, err))
-		c.queue.AddRateLimited(key)
-		return true
-	}
-	c.queue.Forget(key)
-	return true
 }
 
 func (c *controller) process(ctx context.Context, key string) error {
